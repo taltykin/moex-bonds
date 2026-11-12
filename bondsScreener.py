@@ -1,16 +1,22 @@
 """
-Профессиональный скринер облигаций Московской Биржи (ISS MOEX API) v8.
+Профессиональный скринер облигаций Московской Биржи (ISS MOEX API) v9.
 Все пользовательские настройки вынесены в САМОЕ НАЧАЛО ФАЙЛА (блок CONFIG).
 
-Исправления в v8:
-1. Точная проверка БУДУЩЕЙ АМОРТИЗАЦИИ по официальному графику погашений Мосбиржи
-   (/iss/statistics/engines/stock/markets/bonds/bondization/{secid}.json):
-   - Теперь скринер проверяет не только уже прошедшую амортизацию (FACEVALUE < INITIALFACEVALUE),
-     но и запланированные в будущем выплаты номинала до даты полного погашения!
-   - Такие бумаги как RU000A1099P0 гарантированно определяются как бумаги С АМОРТИЗАЦИЕЙ
-     и отсекаются при выставлении "has_amortization": "no".
-2. Также по графику bondization проверяются будущие даты оферт (offers), если в общей таблице
-   биржи поле OFFERDATE не заполнено.
+Добавлено в v9:
+1. Гибкая система СОРТИРОВКИ результатов (параметры `sort_by` и `sort_order` в CONFIG и CLI):
+   - "ytm"          -> По эффективной доходности к погашению (YTM, % годовых)
+   - "tkd"          -> По текущей купонной доходности к рыночной цене покупки (ТКД, % годовых)
+   - "coupon_rate"  -> По номинальной ставке купона (COUPONPERCENT, % годовых)
+   - "coupon_rub"   -> По размеру одной купонной выплаты в рублях (₽)
+   - "maturity"     -> По сроку до погашения (дней) — удобно для выбора самых коротких/длинных бумаг
+   - "price"        -> По чистой цене (% от номинала) — удобно искать максимальный дисконт
+   - "volume"       -> По дневному объему торгов / ликвидности (₽)
+   - "nkd"          -> По минимальному накопленному купонному доходу (НКД, ₽)
+   - "freq"         -> По частоте выплат (ежемесячные вверху)
+   - "rating_proxy" -> Умный скоринг "Доходность + Ликвидность" (отсекает неликвидные выбросы)
+2. Направление сортировки `sort_order`:
+   - "desc" -> По убыванию (от большего к меньшему, например, от самой высокой доходности)
+   - "asc"  -> По возрастанию (от меньшего к большему, например, от самого короткого срока или самой низкой цены)
 """
 
 import sys
@@ -31,61 +37,80 @@ CONFIG = {
     #    "both"     -> И в терминал на экран, и в Excel-файл (по умолчанию)
     #    "terminal" -> Только в терминал (быстрый просмотр без файлов)
     #    "file"     -> Только в Excel-файл (тихий режим)
-    "output_mode": "terminal",
+    "output_mode": "both",
     "output_filename": "screened_bonds.xlsx",
 
-    # 2. ТИП КУПОНА:
+    # 2. СОРТИРОВКА РЕЗУЛЬТАТА (НОВЫЙ БЛОК):
+    #    Доступные варианты `sort_by`:
+    #    - "ytm"          -> По доходности к погашению (YTM, %)
+    #    - "tkd"          -> По текущей купонной доходности к цене покупки (ТКД, %)
+    #    - "coupon_rate"  -> По ставке купона к номиналу (%)
+    #    - "coupon_rub"   -> По сумме купонной выплаты в рублях (₽)
+    #    - "maturity"     -> По сроку до погашения (дней)
+    #    - "price"        -> По чистой цене (% от номинала)
+    #    - "volume"       -> По объему торгов / ликвидности (₽)
+    #    - "nkd"          -> По накопленному купонному доходу (НКД, ₽)
+    #    - "freq"         -> По частоте выплат в год (12 -> 4 -> 2 -> 1)
+    #    - "smart"        -> Умный баланс: высокая доходность + высокая ликвидность
+    "sort_by": "ytm",
+
+    #    Направление сортировки `sort_order`:
+    #    - "desc" -> По убыванию (от большего к меньшему: макс. доходность / макс. объем)
+    #    - "asc"  -> По возрастанию (от меньшего к большему: ближайший срок / мин. цена / мин. НКД)
+    "sort_order": "desc",
+
+    # 3. ТИП КУПОНА:
     #    "all"     -> Все типы купонов (и фиксированные, и флоатеры)
     #    "fixed"   -> Только постоянный / фиксированный купон (прогнозируемый доход)
     #    "floater" -> Только плавающий купон / флоатер (привязан к ставке ЦБ / RUONIA)
     "coupon_type": "fixed",
 
-    # 3. ПЕРИОДИЧНОСТЬ ВЫПЛАТ КУПОНОВ:
+    # 4. ПЕРИОДИЧНОСТЬ ВЫПЛАТ КУПОНОВ:
     #    ["monthly", "quarterly", "semi"] -> Месячные (12/год), квартальные (4/год) и полугодовые (2/год)
     #    "monthly"   -> Только ежемесячные (12 раз в год)
     #    "quarterly" -> Только раз в квартал (4 раза в год)
     #    "semi"      -> Только раз в полгода (2 раза в год)
     #    "annual"    -> Только раз в год (1 раз в год)
     #    "all"       -> Любая периодичность выплат
-    "coupon_freq": ["monthly", "quarterly"],
+    "coupon_freq": ["all"],
 
-    # 4. ТИП ЭМИТЕНТА:
+    # 5. ТИП ЭМИТЕНТА:
     #    "all"        -> Все типы бумаг
     #    "corporate"  -> Только корпоративные облигации компаний
     #    "ofz"        -> Только государственные ОФЗ
     #    "municipal"  -> Только муниципальные и региональные (субъекты РФ)
-    "issuer_type": "corporate",
+    "issuer_type": "ofz",
 
-    # 5. СРОК ДО ПОГАШЕНИЯ (в днях):
+    # 6. СРОК ДО ПОГАШЕНИЯ (в днях):
     #    550 дней ~ 18 месяцев под покупку квартиры в Москве
-    "min_days_to_mat": 365,
-    "max_days_to_mat": 550,
+    "min_days_to_mat": 300,
+    "max_days_to_mat": 10000000,
 
-    # 6. ЧИСТАЯ ЦЕНА (% от номинала):
-    "max_price_pct": 100.5,
-    "min_price_pct": 70.0,
+    # 7. ЧИСТАЯ ЦЕНА (% от номинала):
+    "max_price_pct": 99.0,
+    "min_price_pct": 0.0,
 
-    # 7. АМОРТИЗАЦИЯ И ОФЕРТА:
+    # 8. АМОРТИЗАЦИЯ И ОФЕРТА:
     #    "no"  -> СТРОГО БЕЗ амортизации (включая будущую по графику) и БЕЗ оферты
     #    "yes" -> Только с амортизацией / только с офертой
     #    "any" -> Не важно
     "has_amortization": "no",
     "has_offer": "no",
 
-    # 8. ДОХОДНОСТЬ К ПОГАШЕНИЮ (YTM, % годовых) — применяется только для fixed:
-    "min_ytm": 16.0,
+    # 9. ДОХОДНОСТЬ К ПОГАШЕНИЮ (YTM, % годовых) — применяется только для fixed:
+    "min_ytm": 12.0,
     "max_ytm": 28.0,
 
-    # 9. КУПОННАЯ ДОХОДНОСТЬ (% годовых):
-    #    a) Ставка купона к номиналу (COUPONPERCENT), % годовых
-    "min_coupon_rate": 14.0,
+    # 10. КУПОННАЯ ДОХОДНОСТЬ (% годовых):
+    #     a) Ставка купона к номиналу (COUPONPERCENT), % годовых
+    "min_coupon_rate": 12.0,
     "max_coupon_rate": 35.0,
 
-    #    b) Текущая купонная доходность к рыночной цене покупки (ТКД), % годовых
-    "min_current_coupon_yield": 14.5,
+    #     b) Текущая купонная доходность к рыночной цене покупки (ТКД), % годовых
+    "min_current_coupon_yield": 12.0,
     "max_current_coupon_yield": 35.0,
 
-    # 10. ЛИКВИДНОСТЬ (дневной объем торгов, ₽):
+    # 11. ЛИКВИДНОСТЬ (дневной объем торгов, ₽):
     "min_volume_rub": 200_000,
 }
 # ==============================================================================
@@ -97,6 +122,20 @@ BOARDS_MAPPING = {
     "TQIR": "Муниципальная",
     "TQOD": "Муниципальная"
 }
+
+SORT_OPTIONS_MAP = {
+    "ytm": ("YIELD", "Доходность к погашению (YTM, %)"),
+    "tkd": ("CURRENT_COUPON_YIELD", "Текущая купонная доходность к цене (ТКД, %)"),
+    "coupon_rate": ("COUPONPERCENT", "Ставка купона к номиналу (%)"),
+    "coupon_rub": ("COUPONVALUE", "Сумма купонной выплаты (₽)"),
+    "maturity": ("DAYS_TO_MAT", "Срок до погашения (дней)"),
+    "price": ("CLEAN_PRICE_PCT", "Чистая цена (% от номинала)"),
+    "volume": ("VALTODAY", "Объем торгов за день (₽)"),
+    "nkd": ("ACCRUEDINT", "Накопленный купонный доход (НКД, ₽)"),
+    "freq": ("PAYMENTS_PER_YEAR", "Периодичность выплат купона"),
+    "smart": ("SMART_SCORE", "Умный рейтинг (Доходность + Ликвидность)"),
+}
+
 
 def fetch_moex_bonds_data():
     """Загружает актуальный срез всех секций облигаций с Мосбиржи."""
@@ -127,11 +166,7 @@ def fetch_moex_bonds_data():
 
 
 def check_bond_schedule_details(secid):
-    """
-    Запрашивает официальный график купонов, амортизации и оферт по конкретной бумаге:
-    https://iss.moex.com/iss/statistics/engines/stock/markets/bonds/bondization/{secid}.json
-    Возвращает кортеж (secid, has_future_amortization, has_future_offer).
-    """
+    """Запрашивает официальный график купонов, амортизации и оферт по конкретной бумаге."""
     url = f"https://iss.moex.com/iss/statistics/engines/stock/markets/bonds/bondization/{secid}.json?iss.meta=off"
     headers = {"User-Agent": "Mozilla/5.0"}
     has_amort = False
@@ -142,21 +177,17 @@ def check_bond_schedule_details(secid):
         if r.status_code == 200:
             data = r.json()
 
-            # 1. Проверка графика амортизации (таблица amortizations)
             amort_block = data.get("amortizations", {})
             amort_rows = amort_block.get("data", [])
             amort_cols = amort_block.get("columns", [])
-            # Если в графике амортизации более 1 даты погашения номинала (или есть промежуточная выплата тела)
             if len(amort_rows) > 1:
                 has_amort = True
             elif len(amort_rows) == 1 and amort_cols:
                 row_dict = dict(zip(amort_cols, amort_rows[0]))
-                # Если доля погашения < 100% или data_source == 'amortization'
                 prc = row_dict.get("valueprc")
                 if prc is not None and float(prc) < 100.0:
                     has_amort = True
 
-            # 2. Проверка графика оферт (таблица offers)
             offers_block = data.get("offers", {})
             offers_rows = offers_block.get("data", [])
             offers_cols = offers_block.get("columns", [])
@@ -228,6 +259,34 @@ def detect_coupon_type(row):
     return "Постоянный / Фиксированный"
 
 
+def apply_sorting(df, sort_by, sort_order):
+    """Выполняет сортировку отфильтрованного датафрейма по выбранному критерию и направлению."""
+    if df.empty:
+        return df
+
+    sb = str(sort_by).lower().strip()
+    so = str(sort_order).lower().strip()
+    ascending = so in ["asc", "up", "по возрастанию", "возрастание"]
+
+    # Расчет композитного рейтинга "smart" (Доходность + логарифм ликвидности)
+    import numpy as np
+    base_yield = df["YIELD"].fillna(df["CURRENT_COUPON_YIELD"]).fillna(0)
+    log_vol = np.log10(df["VALTODAY"].clip(lower=1))
+    df["SMART_SCORE"] = base_yield * 0.75 + log_vol * 1.25
+
+    col_name, _ = SORT_OPTIONS_MAP.get(sb, ("YIELD", "Доходность к погашению (YTM, %)"))
+
+    # Вторичный ключ сортировки для разрешения ничьих
+    secondary_col = "VALTODAY" if col_name != "VALTODAY" else "CURRENT_COUPON_YIELD"
+    secondary_asc = False
+
+    return df.sort_values(
+        by=[col_name, secondary_col],
+        ascending=[ascending, secondary_asc],
+        na_position="last"
+    )
+
+
 def screen_moex_bonds(
     issuer_type=CONFIG["issuer_type"],
     min_days_to_mat=CONFIG["min_days_to_mat"],
@@ -245,6 +304,8 @@ def screen_moex_bonds(
     min_current_coupon_yield=CONFIG["min_current_coupon_yield"],
     max_current_coupon_yield=CONFIG["max_current_coupon_yield"],
     min_volume_rub=CONFIG["min_volume_rub"],
+    sort_by=CONFIG["sort_by"],
+    sort_order=CONFIG["sort_order"],
     output_mode=CONFIG["output_mode"],
     output_filename=CONFIG["output_filename"]
 ):
@@ -253,6 +314,14 @@ def screen_moex_bonds(
     save_file = output_mode in ["file", "both"]
     ct = str(coupon_type).lower()
     is_floater_search = ct in ["floater", "плавающий", "флоатер"]
+
+    # Автоматическая подстройка сортировки для флоатеров, если выбран YTM (у флоатеров YTM=0)
+    effective_sort_by = str(sort_by).lower()
+    if is_floater_search and effective_sort_by == "ytm":
+        effective_sort_by = "tkd"
+
+    _, sort_desc = SORT_OPTIONS_MAP.get(effective_sort_by, ("YIELD", "Доходность к погашению (YTM, %)"))
+    order_desc = "по возрастанию (от меньшего к большему)" if str(sort_order).lower() == "asc" else "по убыванию (от большего к меньшему)"
 
     freq_counts = normalize_freq_list(coupon_freq)
     if freq_counts is None:
@@ -263,8 +332,9 @@ def screen_moex_bonds(
 
     if show_terminal:
         print("=" * 88)
-        print("🔍 СКРИНЕР ОБЛИГАЦИЙ МОСБИРЖИ (ISS MOEX API) v8")
-        print("Параметры фильтрации:")
+        print("🔍 СКРИНЕР ОБЛИГАЦИЙ МОСБИРЖИ (ISS MOEX API) v9")
+        print("Параметры фильтрации и сортировки:")
+        print(f" • Сортировка:            {sort_desc} — {order_desc}")
         print(f" • Эмитенты:              {str(issuer_type).upper()}")
         print(f" • Срок погашения:        от {min_days_to_mat} до {max_days_to_mat} дней (~{max_days_to_mat//30} мес.)")
         print(f" • Выплаты купона:        {freq_desc}")
@@ -321,7 +391,6 @@ def screen_moex_bonds(
     df["FREQ_STR"] = [t[0] for t in freq_tuples]
     df["PAYMENTS_PER_YEAR"] = [t[1] for t in freq_tuples]
 
-    # Базовая проверка уже начавшейся амортизации и оферты
     def check_initial_amort(row):
         init_fv = row.get("INITIALFACEVALUE")
         curr_fv = row.get("FACEVALUE")
@@ -351,9 +420,7 @@ def screen_moex_bonds(
 
     df["TERM_STR"] = df["DAYS_TO_MAT"].apply(format_term)
 
-    # =========================================================
-    # ПЕРВИЧНАЯ ФИЛЬТРАЦИЯ (до глубокой проверки графика bondization)
-    # =========================================================
+    # Первичная фильтрация
     mask = pd.Series(True, index=df.index)
 
     it = str(issuer_type).lower()
@@ -402,9 +469,7 @@ def screen_moex_bonds(
 
     candidates = df[mask].copy()
 
-    # =========================================================
-    # ГЛУБОКАЯ ПРОВЕРКА БУДУЩЕЙ АМОРТИЗАЦИИ И ОФЕРТ ПО ГРАФИКУ
-    # =========================================================
+    # Глубокая проверка будущей амортизации и оферт по графику bondization
     ha = str(has_amortization).lower()
     ho = str(has_offer).lower()
 
@@ -415,7 +480,6 @@ def screen_moex_bonds(
         secids = candidates["SECID"].unique().tolist()
         schedule_map = {}
 
-        # Запрашиваем график выплат параллельно в 10 потоков (занимает ~0.5 - 1.5 сек)
         with ThreadPoolExecutor(max_workers=10) as executor:
             futures = {executor.submit(check_bond_schedule_details, s): s for s in secids}
             for future in as_completed(futures):
@@ -431,7 +495,6 @@ def screen_moex_bonds(
                 if fut_offer:
                     candidates.at[idx, "HAS_OFFER"] = True
 
-    # Применяем финальный фильтр амортизации и оферт
     final_mask = pd.Series(True, index=candidates.index)
     if ha in ["no", "false", "нет", "без"]:
         final_mask = final_mask & (~candidates["HAS_AMORT"])
@@ -444,7 +507,9 @@ def screen_moex_bonds(
         final_mask = final_mask & (candidates["HAS_OFFER"])
 
     filtered = candidates[final_mask].copy()
-    filtered = filtered.sort_values(by=["CURRENT_COUPON_YIELD", "VALTODAY"], ascending=[False, False], na_position="last")
+
+    # Применяем выбранную пользователем сортировку
+    filtered = apply_sorting(filtered, effective_sort_by, sort_order)
 
     # ---------------------------------------------------------
     # ВЫВОД В ТЕРМИНАЛ
@@ -467,7 +532,7 @@ def screen_moex_bonds(
                 print(f"{icon} {row['SHORTNAME']:<24} {row['ISSUER_TYPE']:<14} Цена: {row['CLEAN_PRICE_PCT']:>6.2f} %   YTM: {ytm_str}")
                 mat_d = row['MATDATE'].strftime('%d.%m.%Y') if pd.notnull(row['MATDATE']) else '—'
                 print(f"   {row['SECID']:<24} Срок: {row['TERM_STR']:<12} Погашение: {mat_d:<10} Объем: {row['VALTODAY']:>10,.0f} ₽")
-                print(f"   Ставка купона: {cp_str} | ТКД (к цене): {tkd_str} | Выплата: {val_str} | Выплат: {row['FREQ_STR']}{amort_tag}{offer_tag}")
+                print(f"   Ставка купона: {cp_str} | ТКД (к цене): {tkd_str} | Выплата: {val_str} | Выплат: {row['FREQ_STR']} | НКД: {row['ACCRUEDINT']:.2f} ₽{amort_tag}{offer_tag}")
                 print("-" * 88)
 
     # ---------------------------------------------------------
@@ -571,8 +636,20 @@ def screen_moex_bonds(
 
 
 def parse_cli_args():
-    parser = argparse.ArgumentParser(description="Скринер облигаций Мосбиржи под покупку недвижимости v8")
+    parser = argparse.ArgumentParser(description="Скринер облигаций Мосбиржи под покупку недвижимости v9")
     parser.add_argument("-o", "--output", choices=["terminal", "file", "both"], default=CONFIG["output_mode"], help="Режим вывода")
+    parser.add_argument(
+        "-s", "--sort",
+        choices=list(SORT_OPTIONS_MAP.keys()),
+        default=CONFIG["sort_by"],
+        help="Поле сортировки: ytm, tkd, coupon_rate, coupon_rub, maturity, price, volume, nkd, freq, smart"
+    )
+    parser.add_argument(
+        "--order",
+        choices=["desc", "asc"],
+        default=CONFIG["sort_order"],
+        help="Направление сортировки: desc (по убыванию), asc (по возрастанию)"
+    )
     parser.add_argument("-t", "--type", choices=["all", "ofz", "municipal", "corporate"], default=CONFIG["issuer_type"], help="Тип эмитента")
     parser.add_argument("--min-days", type=int, default=CONFIG["min_days_to_mat"], help="Мин. дней до погашения")
     parser.add_argument("--max-days", type=int, default=CONFIG["max_days_to_mat"], help="Макс. дней до погашения")
@@ -599,6 +676,8 @@ def parse_cli_args():
         min_current_coupon_yield=args.min_tkd,
         has_amortization=args.amort,
         has_offer=args.offer,
+        sort_by=args.sort,
+        sort_order=args.order,
         output_mode=args.output,
         output_filename=args.filename
     )
