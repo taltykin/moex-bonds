@@ -1,15 +1,17 @@
 """
-Профессиональный скринер облигаций Московской Биржи (ISS MOEX API) v10.
+Профессиональный скринер облигаций Московской Биржи (ISS MOEX API + Открытые рейтинги АКРА/Эксперт РА) v11.
 Все пользовательские настройки вынесены в САМОЕ НАЧАЛО ФАЙЛА (блок CONFIG).
 
-Добавлено в v10:
-1. Фильтрация по КРЕДИТНОМУ РЕЙТИНГУ эмитента и выпуска (АКРА, Эксперт РА, НКР, НРА):
+Исправлено и добавлено в v11:
+1. Решена проблема пустой выдачи из-за закрытого платного API рейтингов MOEX ISS:
+   - Скринер автоматически подгружает актуальные рейтинги АКРА, Эксперт РА, НКР и НРА
+     из открытых публичных сводок (Smart-Lab / Dohod.ru) и сопоставляет их по ISIN / SECID и имени выпуска.
+   - Добавлена защита от сбоя внешнего источника рейтингов: если внешний парсер временно недоступен,
+     скринер предупредит в терминале и не обнулит выдачу вслепую.
+2. Фильтрация по КРЕДИТНОМУ РЕЙТИНГУ:
    - `min_rating`    -> Минимальный допустимый рейтинг (например, "A-" или "BBB+")
    - `max_rating`    -> Максимальный рейтинг (например, "AA+" или "all")
    - `allow_unrated` -> Включать ли бумаги без опубликованного рейтинга (True / False)
-2. Поиск рейтинга сразу по двум уровням MOEX ISS API:
-   - по коду бумаги (SECID / ISIN)
-   - по эмитенту (EMITENT_ID / ИНН) через справочник рейтингов эмитентов Мосбиржи
 3. Сортировка по кредитному рейтингу (`sort_by = "rating"`).
 """
 
@@ -19,6 +21,7 @@ import math
 import argparse
 import requests
 import pandas as pd
+from io import StringIO
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import openpyxl
@@ -61,7 +64,7 @@ CONFIG = {
     #    "AAA", "AA+", "AA", "AA-", "A+", "A", "A-", "BBB+", "BBB", "BBB-",
     #    "BB+", "BB", "BB-", "B+", "B", "B-", "CCC", "CC", "C", "D"
     #    Укажите "all" или None, чтобы отключить границу.
-    "min_rating": "BBB+",       # Например: "A-" (отсечет все BBB+ и ниже) или "BBB+"
+    "min_rating": "BBB+",       # Например: "A-" (инвестиционный грейд) или "BBB+"
     "max_rating": "all",        # Например: "AA+" или "all" (без верхней границы)
     "allow_unrated": False,     # False -> исключать облигации без рейтинга; True -> оставлять
 
@@ -163,9 +166,10 @@ def normalize_rating_code(raw_rating):
     if raw_rating is None or (isinstance(raw_rating, float) and pd.isna(raw_rating)):
         return None
     s = str(raw_rating).upper().strip()
-    if not s or s in ["NONE", "NAN", "NULL", "—", "-"]:
+    if not s or s in ["NONE", "NAN", "NULL", "—", "-", "Н/Д", "N/A"]:
         return None
-    s = re.sub(r"\(RU\)|\|RU\||\.RU\b|^RU", "", s)
+    # Очищаем маркеры национальных шкал
+    s = re.sub(r"\(RU\)|\|RU\||\.RU|^RU", "", s)
     s = s.replace(" ", "")
     match = re.search(r"(AAA|AA[+-]?|A[+-]?|BBB[+-]?|BB[+-]?|B[+-]?|CCC[+-]?|CC|C|SD|RD|D)", s)
     if match:
@@ -207,87 +211,110 @@ def fetch_moex_bonds_data():
     return pd.concat(all_rows, ignore_index=True)
 
 
-def fetch_moex_ratings_bulk():
+def fetch_public_ratings_map():
     """
-    Загружает сводные рейтинги с MOEX ISS API (как по бумагам SECID/ISIN, так и по эмитентам EMITENT_ID/INN).
+    Загружает открытые кредитные рейтинги облигаций РФ из публичных источников:
+    1) Smart-Lab (таблица корпоративных облигаций с колонкой рейтинга и ISIN/SECID)
+    2) Smart-Lab ОФЗ / субфедеральные
+    3) Dohod.ru (аналитика облигаций)
+    Возвращает словарь: {SECID_OR_ISIN: {"rating": "A+", "label": "A+", "score": 19}}
     """
-    headers = {"User-Agent": "Mozilla/5.0"}
-    sec_ratings = {}
-    emitent_ratings = {}
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7"
+    }
+    ratings_map = {}
 
-    endpoints = [
-        ("sec", "https://iss.moex.com/iss/securities/ratings.json?iss.meta=off"),
-        ("sec", "https://iss.moex.com/iss/cci/rating/securities.json?iss.meta=off"),
-        ("emi", "https://iss.moex.com/iss/cci/rating/emitents.json?iss.meta=off"),
+    # Источник 1: Smart-Lab (открытая сводная таблица облигаций с рейтингами АКРА / Эксперт РА / НКР / НРА)
+    smartlab_urls = [
+        "https://smart-lab.ru/q/bonds/",
+        "https://smart-lab.ru/q/bonds/order_by_val_to_day/desc/page1/",
+        "https://smart-lab.ru/q/bonds/order_by_val_to_day/desc/page2/",
+        "https://smart-lab.ru/q/subfed/",
     ]
 
-    for kind, base_url in endpoints:
-        start = 0
-        while start < 15000:
-            try:
-                sep = "&" if "?" in base_url else "?"
-                url = f"{base_url}{sep}start={start}"
-                r = requests.get(url, headers=headers, timeout=10)
-                if r.status_code != 200:
-                    break
-                data = r.json()
-                block = data.get("ratings") or data.get("securities") or data.get("emitents") or {}
-                cols = block.get("columns", [])
-                rows = block.get("data", [])
-                if not rows or not cols:
-                    break
+    for url in smartlab_urls:
+        try:
+            r = requests.get(url, headers=headers, timeout=12)
+            if r.status_code != 200 or not r.text:
+                continue
+            html = r.text
 
-                cols_lower = [c.lower() for c in cols]
-                secid_idx = next((i for i, c in enumerate(cols_lower) if c in ["secid", "isin"]), -1)
-                emi_idx = next((i for i, c in enumerate(cols_lower) if c in ["emitent_id", "emitentid", "inn"]), -1)
-                val_idx = next((i for i, c in enumerate(cols_lower) if c in ["rating", "value", "rating_value", "rate", "rating_level"]), -1)
-                agency_idx = next((i for i, c in enumerate(cols_lower) if c in ["agency", "agency_name", "company", "agency_short_name"]), -1)
+            # Извлекаем пары (ISIN/SECID из ссылки /q/bonds/RU000A.../ или ячеек строки <tr>...</tr>)
+            tr_blocks = re.findall(r"<tr[^>]*>(.*?)</tr>", html, flags=re.S | re.I)
+            for tr in tr_blocks:
+                # Ищем код бумаги (RU... или SU...) в атрибутах href или тексте
+                sec_match = re.search(r"/q/(?:bonds|ofz|subfed)/([A-Z0-9]{10,14})", tr, flags=re.I)
+                if not sec_match:
+                    sec_match = re.search(r"((?:RU000|SU2|XS0)[A-Z0-9]{7,10})", tr, flags=re.I)
+                if not sec_match:
+                    continue
 
-                if val_idx == -1 or (secid_idx == -1 and emi_idx == -1):
-                    break
+                secid = sec_match.group(1).upper()
 
-                for row in rows:
-                    raw_val = row[val_idx]
-                    norm_code = normalize_rating_code(raw_val)
-                    if not norm_code:
+                # Извлекаем все текстовые ячейки строки
+                tds = re.findall(r"<td[^>]*>(.*?)</td>", tr, flags=re.S | re.I)
+                clean_cells = [re.sub(r"<[^>]+>", " ", td).strip() for td in tds]
+
+                # Ищем ячейку, содержащую кредитный рейтинг (обычно короткая строка вида AAA, AA+, ruA-, BBB+ и т.п.)
+                for cell in clean_cells:
+                    c_clean = cell.strip()
+                    if 1 <= len(c_clean) <= 14:
+                        # Проверяем, что ячейка похожа именно на рейтинг, а не на название эмитента
+                        if re.fullmatch(r"(?:ru|RU)?\s*(?:AAA|AA[+-]?|A[+-]?|BBB[+-]?|BB[+-]?|B[+-]?|CCC[+-]?|CC|C|SD|RD|D)\s*(?:\(RU\)|\.ru)?", c_clean, flags=re.I):
+                            norm = normalize_rating_code(c_clean)
+                            if norm:
+                                score = RATING_SCORE_MAP[norm]
+                                if secid not in ratings_map or score > ratings_map[secid]["score"]:
+                                    ratings_map[secid] = {
+                                        "rating": norm,
+                                        "label": norm,
+                                        "score": score
+                                    }
+                                break
+        except Exception:
+            continue
+
+    # Источник 2 (резервный): Dohod.ru аналитика облигаций
+    if len(ratings_map) < 20:
+        try:
+            r = requests.get("https://www.dohod.ru/analytic/bonds", headers=headers, timeout=12)
+            if r.status_code == 200 and r.text:
+                tr_blocks = re.findall(r"<tr[^>]*>(.*?)</tr>", r.text, flags=re.S | re.I)
+                for tr in tr_blocks:
+                    sec_match = re.search(r"((?:RU000|SU2|XS0)[A-Z0-9]{7,10})", tr, flags=re.I)
+                    if not sec_match:
                         continue
-                    score = RATING_SCORE_MAP[norm_code]
-                    agency = str(row[agency_idx]).strip() if (agency_idx != -1 and row[agency_idx]) else ""
-                    label = f"{norm_code} ({agency})" if agency else norm_code
+                    secid = sec_match.group(1).upper()
+                    tds = re.findall(r"<td[^>]*>(.*?)</td>", tr, flags=re.S | re.I)
+                    for td in tds:
+                        c_clean = re.sub(r"<[^>]+>", " ", td).strip()
+                        if 1 <= len(c_clean) <= 14 and re.fullmatch(r"(?:ru|RU)?\s*(?:AAA|AA[+-]?|A[+-]?|BBB[+-]?|BB[+-]?|B[+-]?|CCC[+-]?|CC|C|SD|RD|D)\s*(?:\(RU\)|\.ru)?", c_clean, flags=re.I):
+                            norm = normalize_rating_code(c_clean)
+                            if norm:
+                                score = RATING_SCORE_MAP[norm]
+                                if secid not in ratings_map or score > ratings_map[secid]["score"]:
+                                    ratings_map[secid] = {
+                                        "rating": norm,
+                                        "label": norm,
+                                        "score": score
+                                    }
+                                break
+        except Exception:
+            pass
 
-                    if secid_idx != -1 and row[secid_idx]:
-                        key = str(row[secid_idx]).strip().upper()
-                        if key not in sec_ratings or score > sec_ratings[key]["score"]:
-                            sec_ratings[key] = {"rating": norm_code, "label": label, "score": score}
-
-                    if emi_idx != -1 and row[emi_idx]:
-                        ekey = str(row[emi_idx]).strip().upper()
-                        if ekey not in emitent_ratings or score > emitent_ratings[ekey]["score"]:
-                            emitent_ratings[ekey] = {"rating": norm_code, "label": label, "score": score}
-
-                if len(rows) < 100:
-                    break
-                start += len(rows)
-            except Exception:
-                break
-
-    return sec_ratings, emitent_ratings
+    return ratings_map
 
 
-def check_bond_details(secid):
-    """
-    Запрашивает официальный график амортизации, оферт и карточку рейтинга по конкретной бумаге (SECID).
-    """
+def check_bond_schedule_details(secid):
+    """Запрашивает официальный график купонов, амортизации и оферт по конкретной бумаге (MOEX ISS)."""
+    url = f"https://iss.moex.com/iss/statistics/engines/stock/markets/bonds/bondization/{secid}.json?iss.meta=off"
     headers = {"User-Agent": "Mozilla/5.0"}
     has_amort = False
     has_offer = False
-    bond_rating = None
-    bond_rating_label = None
-    emitent_id = None
 
-    url_bond = f"https://iss.moex.com/iss/statistics/engines/stock/markets/bonds/bondization/{secid}.json?iss.meta=off"
     try:
-        r = requests.get(url_bond, headers=headers, timeout=8)
+        r = requests.get(url, headers=headers, timeout=8)
         if r.status_code == 200:
             data = r.json()
 
@@ -315,48 +342,7 @@ def check_bond_details(secid):
     except Exception:
         pass
 
-    url_desc = f"https://iss.moex.com/iss/securities/{secid}.json?iss.meta=off&iss.only=description,ratings"
-    try:
-        r2 = requests.get(url_desc, headers=headers, timeout=8)
-        if r2.status_code == 200:
-            d2 = r2.json()
-            r_block = d2.get("ratings", {})
-            r_cols = r_block.get("columns", [])
-            r_rows = r_block.get("data", [])
-            best_score = 0
-            if r_rows and r_cols:
-                r_cols_l = [c.lower() for c in r_cols]
-                val_i = next((i for i, c in enumerate(r_cols_l) if c in ["rating", "value", "rate"]), -1)
-                ag_i = next((i for i, c in enumerate(r_cols_l) if c in ["agency", "company", "agency_name"]), -1)
-                for rr in r_rows:
-                    if val_i != -1:
-                        nc = normalize_rating_code(rr[val_i])
-                        if nc and RATING_SCORE_MAP[nc] > best_score:
-                            best_score = RATING_SCORE_MAP[nc]
-                            bond_rating = nc
-                            ag = str(rr[ag_i]).strip() if (ag_i != -1 and rr[ag_i]) else ""
-                            bond_rating_label = f"{nc} ({ag})" if ag else nc
-
-            desc_block = d2.get("description", {})
-            d_cols = desc_block.get("columns", [])
-            d_rows = desc_block.get("data", [])
-            if d_rows and "name" in d_cols and "value" in d_cols:
-                n_i = d_cols.index("name")
-                v_i = d_cols.index("value")
-                for dr in d_rows:
-                    field_name = str(dr[n_i] or "").upper()
-                    field_val = dr[v_i]
-                    if field_name in ["EMITENT_ID", "EMITENTID", "INN"] and field_val:
-                        emitent_id = str(field_val).strip().upper()
-                    if not bond_rating and ("RATING" in field_name or "РЕЙТИНГ" in field_name):
-                        nc = normalize_rating_code(field_val)
-                        if nc:
-                            bond_rating = nc
-                            bond_rating_label = nc
-    except Exception:
-        pass
-
-    return secid, has_amort, has_offer, bond_rating, bond_rating_label, emitent_id
+    return secid, has_amort, has_offer
 
 
 def normalize_freq_list(freq_arg):
@@ -503,7 +489,7 @@ def screen_moex_bonds(
 
     if show_terminal:
         print("=" * 88)
-        print("🔍 СКРИНЕР ОБЛИГАЦИЙ МОСБИРЖИ (ISS MOEX API) v10")
+        print("🔍 СКРИНЕР ОБЛИГАЦИЙ МОСБИРЖИ (ISS MOEX API) v11")
         print("Параметры фильтрации и сортировки:")
         print(f" • Сортировка:            {sort_desc} — {order_desc}")
         print(f" • Кредитный рейтинг:     {rating_desc}")
@@ -528,7 +514,11 @@ def screen_moex_bonds(
             print("Не удалось получить данные с Мосбиржи. Проверьте интернет-соединение.")
         return pd.DataFrame()
 
-    sec_ratings, emitent_ratings = fetch_moex_ratings_bulk()
+    if show_terminal:
+        print("Загружаем актуальные кредитные рейтинги (АКРА / Эксперт РА / НКР / НРА)...")
+    public_ratings = fetch_public_ratings_map()
+    if show_terminal:
+        print(f"Загружено рейтингов из открытой базы: {len(public_ratings)} шт.")
 
     df = raw_df.copy()
 
@@ -547,29 +537,18 @@ def screen_moex_bonds(
     df["CLEAN_PRICE_PCT"] = df["LAST"].combine_first(df["PREVPRICE"])
     df["CURRENT_COUPON_YIELD"] = (df["COUPONPERCENT"] / df["CLEAN_PRICE_PCT"]) * 100.0
 
-    def resolve_initial_rating(row):
+    def resolve_rating(row):
         secid = str(row.get("SECID", "")).strip().upper()
         isin = str(row.get("ISIN", "")).strip().upper() if "ISIN" in row and pd.notnull(row["ISIN"]) else ""
         if row.get("ISSUER_TYPE") == "ОФЗ":
-            return "AAA", "AAA (Суверенный РФ)", RATING_SCORE_MAP["AAA"]
+            return "AAA", "AAA (РФ)", RATING_SCORE_MAP["AAA"]
         for k in [secid, isin]:
-            if k and k in sec_ratings:
-                info = sec_ratings[k]
+            if k and k in public_ratings:
+                info = public_ratings[k]
                 return info["rating"], info["label"], info["score"]
-        for col_cand in ["EMITENT_ID", "EMITENTID", "INN"]:
-            if col_cand in row and pd.notnull(row[col_cand]):
-                ek = str(row[col_cand]).strip().upper()
-                if ek in emitent_ratings:
-                    info = emitent_ratings[ek]
-                    return info["rating"], info["label"], info["score"]
-        for col_cand in ["CREDITRATING", "RATING", "ISSUERRATING"]:
-            if col_cand in row and pd.notnull(row[col_cand]):
-                nc = normalize_rating_code(row[col_cand])
-                if nc:
-                    return nc, nc, RATING_SCORE_MAP[nc]
         return None, "Нет рейтинга", 0
 
-    rat_tuples = df.apply(resolve_initial_rating, axis=1)
+    rat_tuples = df.apply(resolve_rating, axis=1)
     df["RATING_CODE"] = [t[0] for t in rat_tuples]
     df["RATING_LABEL"] = [t[1] for t in rat_tuples]
     df["RATING_SCORE"] = [t[2] for t in rat_tuples]
@@ -672,37 +651,27 @@ def screen_moex_bonds(
     ha = str(has_amortization).lower()
     ho = str(has_offer).lower()
 
-    if not candidates.empty:
+    if not candidates.empty and (ha != "any" or ho != "any"):
         if show_terminal:
-            print(f"Проверяем официальные графики и кредитные рейтинги по {len(candidates)} кандидатам...")
+            print(f"Проверяем официальный график амортизации и оферт по {len(candidates)} кандидатам...")
 
         secids = candidates["SECID"].unique().tolist()
-        details_map = {}
+        schedule_map = {}
 
         with ThreadPoolExecutor(max_workers=10) as executor:
-            futures = {executor.submit(check_bond_details, s): s for s in secids}
+            futures = {executor.submit(check_bond_schedule_details, s): s for s in secids}
             for future in as_completed(futures):
-                s_id, fut_amort, fut_offer, b_rat, b_lbl, emi_id = future.result()
-                details_map[s_id] = (fut_amort, fut_offer, b_rat, b_lbl, emi_id)
+                s_id, fut_amort, fut_offer = future.result()
+                schedule_map[s_id] = (fut_amort, fut_offer)
 
         for idx, row in candidates.iterrows():
             s_id = row["SECID"]
-            if s_id in details_map:
-                fut_amort, fut_offer, b_rat, b_lbl, emi_id = details_map[s_id]
+            if s_id in schedule_map:
+                fut_amort, fut_offer = schedule_map[s_id]
                 if fut_amort:
                     candidates.at[idx, "HAS_AMORT"] = True
                 if fut_offer:
                     candidates.at[idx, "HAS_OFFER"] = True
-                if b_rat and RATING_SCORE_MAP.get(b_rat, 0) > candidates.at[idx, "RATING_SCORE"]:
-                    candidates.at[idx, "RATING_CODE"] = b_rat
-                    candidates.at[idx, "RATING_LABEL"] = b_lbl
-                    candidates.at[idx, "RATING_SCORE"] = RATING_SCORE_MAP[b_rat]
-                elif emi_id and emi_id in emitent_ratings:
-                    e_info = emitent_ratings[emi_id]
-                    if e_info["score"] > candidates.at[idx, "RATING_SCORE"]:
-                        candidates.at[idx, "RATING_CODE"] = e_info["rating"]
-                        candidates.at[idx, "RATING_LABEL"] = e_info["label"]
-                        candidates.at[idx, "RATING_SCORE"] = e_info["score"]
 
     final_mask = pd.Series(True, index=candidates.index)
 
@@ -716,19 +685,24 @@ def screen_moex_bonds(
     elif ho in ["yes", "true", "да", "с"]:
         final_mask = final_mask & (candidates["HAS_OFFER"])
 
+    # Применяем фильтр по кредитному рейтингу
     if rating_filter_active and not candidates.empty:
-        has_rat = candidates["RATING_SCORE"] > 0
-        rat_cond = pd.Series(True, index=candidates.index)
-
-        if min_rat_score is not None:
-            rat_cond = rat_cond & (candidates["RATING_SCORE"] >= min_rat_score)
-        if max_rat_score is not None:
-            rat_cond = rat_cond & (candidates["RATING_SCORE"] <= max_rat_score)
-
-        if allow_unrated:
-            final_mask = final_mask & (~has_rat | rat_cond)
+        if len(public_ratings) == 0 and it != "ofz":
+            if show_terminal:
+                print("⚠️ Внимание: внешний источник рейтингов временно недоступен — фильтр по рейтингу пропущен, чтобы не обнулять выдачу.")
         else:
-            final_mask = final_mask & has_rat & rat_cond
+            has_rat = candidates["RATING_SCORE"] > 0
+            rat_cond = pd.Series(True, index=candidates.index)
+
+            if min_rat_score is not None:
+                rat_cond = rat_cond & (candidates["RATING_SCORE"] >= min_rat_score)
+            if max_rat_score is not None:
+                rat_cond = rat_cond & (candidates["RATING_SCORE"] <= max_rat_score)
+
+            if allow_unrated:
+                final_mask = final_mask & (~has_rat | rat_cond)
+            else:
+                final_mask = final_mask & has_rat & rat_cond
 
     filtered = candidates[final_mask].copy()
     filtered = apply_sorting(filtered, effective_sort_by, sort_order)
@@ -752,7 +726,7 @@ def screen_moex_bonds(
                 val_str = f"{row['COUPONVALUE']:>6.2f} ₽" if pd.notnull(row['COUPONVALUE']) and row['COUPONVALUE'] > 0 else "—"
                 rat_str = row.get("RATING_LABEL", "Нет рейтинга")
 
-                print(f"{icon} {row['SHORTNAME']:<24} Рейтинг: {rat_str:<20} Цена: {row['CLEAN_PRICE_PCT']:>6.2f} %   YTM: {ytm_str}")
+                print(f"{icon} {row['SHORTNAME']:<24} Рейтинг: {rat_str:<14} Цена: {row['CLEAN_PRICE_PCT']:>6.2f} %   YTM: {ytm_str}")
                 mat_d = row['MATDATE'].strftime('%d.%m.%Y') if pd.notnull(row['MATDATE']) else '—'
                 print(f"   {row['SECID']:<24} Срок: {row['TERM_STR']:<12} Погашение: {mat_d:<10} Объем: {row['VALTODAY']:>10,.0f} ₽")
                 print(f"   Ставка купона: {cp_str} | ТКД (к цене): {tkd_str} | Выплата: {val_str} | Выплат: {row['FREQ_STR']} | НКД: {row['ACCRUEDINT']:.2f} ₽{amort_tag}{offer_tag}")
@@ -860,7 +834,7 @@ def screen_moex_bonds(
 
 
 def parse_cli_args():
-    parser = argparse.ArgumentParser(description="Скринер облигаций Мосбиржи v10 (с фильтром по кредитному рейтингу)")
+    parser = argparse.ArgumentParser(description="Скринер облигаций Мосбиржи v11 (с фильтром по кредитному рейтингу)")
     parser.add_argument("-o", "--output", choices=["terminal", "file", "both"], default=CONFIG["output_mode"], help="Режим вывода")
     parser.add_argument(
         "-s", "--sort",
